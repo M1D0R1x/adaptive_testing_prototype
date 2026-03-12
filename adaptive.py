@@ -1,100 +1,171 @@
-import random
-from typing import Dict, Any
-
-import numpy as np
+import uuid
+from fastapi import FastAPI, HTTPException, Path
+from pydantic import BaseModel
+from database import sessions_collection, questions_collection
+from adaptive import select_next_question, update_ability
+from llm import generate_study_plan
 from bson.objectid import ObjectId
+from collections import Counter
+from typing import Dict, Any, List
 
-from database import questions_collection, sessions_collection
-
-WINDOW = 0.15
-
-
-def logistic(theta: float, a: float, b: float) -> float:
-    return 1 / (1 + np.exp(-a * (theta - b)))
+app = FastAPI(title="Adaptive Diagnostic Engine")
 
 
-def information(theta: float, a: float, b: float) -> float:
-    p = logistic(theta, a, b)
-    return (a ** 2) * p * (1 - p)
+class SubmitAnswer(BaseModel):
+    answer: str
 
 
-def select_next_question(session_id: str) -> Dict[str, Any]:
+class SessionResponse(BaseModel):
+    session_id: str
+
+
+class QuestionResponse(BaseModel):
+    question_text: str
+    options: Dict[str, str]
+    difficulty: float
+    topic: str
+
+
+class AnswerResponse(BaseModel):
+    correct: bool
+    new_ability: float
+
+
+class StudyPlanResponse(BaseModel):
+    study_plan: str
+
+
+@app.post("/start_session", response_model=SessionResponse)
+def start_session():
+    session_id = str(uuid.uuid4())
+
+    session = {
+        "session_id": session_id,
+        "current_ability": 0.5,
+        "answers": [],
+        "questions_asked": [],
+    }
+
+    sessions_collection.insert_one(session)
+
+    return {"session_id": session_id}
+
+
+@app.get("/next_question/{session_id}", response_model=QuestionResponse)
+def get_next_question(session_id: str = Path(...)):
 
     session = sessions_collection.find_one({"session_id": session_id})
+
     if not session:
-        raise ValueError("Session not found")
+        raise HTTPException(status_code=404, detail="Session not found")
 
-    asked_ids = session.get("questions_asked", [])
-    ability = session.get("current_ability", 0.5)
+    if len(session["questions_asked"]) >= 10:
+        raise HTTPException(status_code=400, detail="Test completed")
 
-    questions = list(
-        questions_collection.find({
-            "_id": {"$nin": asked_ids},
-            "difficulty": {
-                "$gte": ability - WINDOW,
-                "$lte": ability + WINDOW
-            }
-        })
-    )
+    try:
+        question = select_next_question(session_id)
 
-    if not questions:
-        questions = list(
-            questions_collection.find({"_id": {"$nin": asked_ids}})
+        sessions_collection.update_one(
+            {"session_id": session_id},
+            {"$push": {"questions_asked": question["_id"]}},
         )
 
-    if not questions:
-        raise ValueError("No more questions available")
+        return {
+            "question_text": question["question_text"],
+            "options": question["options"],
+            "difficulty": question["difficulty"],
+            "topic": question["topic"],
+        }
 
-    scored = []
-
-    for q in questions:
-        a = q.get("discrimination", 1.0)
-        b = q["difficulty"]
-
-        info = information(ability, a, b)
-
-        info += random.uniform(0, 0.02)
-
-        scored.append((info, q))
-
-    scored.sort(reverse=True, key=lambda x: x[0])
-
-    return scored[0][1]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-def update_ability(session_id: str) -> float:
+@app.post("/submit_answer/{session_id}", response_model=AnswerResponse)
+def submit_answer(session_id: str, body: SubmitAnswer):
 
     session = sessions_collection.find_one({"session_id": session_id})
+
     if not session:
-        raise ValueError("Session not found")
+        raise HTTPException(status_code=404, detail="Session not found")
 
-    answers = session.get("answers", [])
+    if not session["questions_asked"]:
+        raise HTTPException(status_code=400, detail="No question asked yet")
 
-    if not answers:
-        return 0.5
+    question_id = session["questions_asked"][-1]
 
-    last = answers[-1]
-
-    question = questions_collection.find_one(
-        {"_id": ObjectId(last["question_id"])}
-    )
+    question = questions_collection.find_one({"_id": question_id})
 
     if not question:
-        raise ValueError("Question not found")
+        raise HTTPException(status_code=500, detail="Question missing")
 
-    theta = session.get("current_ability", 0.5)
+    correct = body.answer.upper() == question["correct_answer"].upper()
 
-    a = question.get("discrimination", 1.0)
-    b = question["difficulty"]
+    answer_record = {
+        "question_id": str(question_id),
+        "response": body.answer,
+        "correct": correct,
+    }
 
-    p = logistic(theta, a, b)
+    sessions_collection.update_one(
+        {"session_id": session_id},
+        {"$push": {"answers": answer_record}},
+    )
 
-    r = 1 if last["correct"] else 0
+    try:
 
-    learning_rate = 0.25
+        new_ability = update_ability(session_id)
 
-    new_theta = theta + learning_rate * a * (r - p)
+        sessions_collection.update_one(
+            {"session_id": session_id},
+            {"$set": {"current_ability": new_ability}},
+        )
 
-    new_theta = max(0.0, min(1.0, new_theta))
+        return {
+            "correct": correct,
+            "new_ability": new_ability,
+        }
 
-    return float(new_theta)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/study_plan/{session_id}", response_model=StudyPlanResponse)
+def get_study_plan(session_id: str):
+
+    session = sessions_collection.find_one({"session_id": session_id})
+
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if len(session["answers"]) < 10:
+        raise HTTPException(status_code=400, detail="Test incomplete")
+
+    missed_topics: List[str] = []
+
+    for answer in session["answers"]:
+
+        if not answer["correct"]:
+
+            q_id = ObjectId(answer["question_id"])
+
+            question = questions_collection.find_one({"_id": q_id})
+
+            if question:
+                missed_topics.append(question["topic"])
+
+    topic_counts = Counter(missed_topics).most_common()
+
+    final_ability = session["current_ability"]
+
+    try:
+
+        plan = generate_study_plan(topic_counts, final_ability)
+
+        return {"study_plan": plan}
+
+    except Exception:
+
+        return {
+            "study_plan": "AI plan unavailable. Review missed topics and practice similar problems."
+        }
